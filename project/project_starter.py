@@ -4,6 +4,7 @@ import os
 import time
 import dotenv
 import ast
+import pprint
 from sqlalchemy.sql import text
 from datetime import datetime, timedelta
 from typing import Dict, List, Union
@@ -590,30 +591,572 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 
 
 # Set up and load your env parameters and instantiate your model.
-
-
+# Load environment variables
+dotenv.load_dotenv()
+ 
+# Database and model configuration will be shared
+# across all specialized agents.
 """Set up tools for your agents to use, these should be methods that combine the database functions above
  and apply criteria to them to ensure that the flow of the system is correct."""
 
 
 # Tools for inventory agent
+def inventory_lookup_tool(item_name: str, as_of_date: str) -> dict:
+    """
+    Check the current stock level for a specific paper item.
+    """
+    try:
+        stock_df = get_stock_level(item_name, as_of_date)
+ 
+        if stock_df.empty:
+            return {
+                "success": False,
+                "item_name": item_name,
+                "message": "Item not found in inventory."
+            }
+ 
+        current_stock = int(stock_df.iloc[0]["current_stock"])
+ 
+        return {
+            "success": True,
+            "item_name": item_name,
+            "current_stock": current_stock,
+            "as_of_date": as_of_date
+        }
+ 
+    except Exception as e:
+        return {
+            "success": False,
+            "item_name": item_name,
+            "error": str(e)
+        }
 
+def all_inventory_tool(as_of_date: str) -> dict:
+    """
+    Return stock levels for all paper products.
+    """
+    try:
+        inventory = get_all_inventory(as_of_date)
+ 
+        return {
+            "success": True,
+            "as_of_date": as_of_date,
+            "inventory": inventory
+        }
+ 
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+def supplier_delivery_tool(
+    request_date: str,
+    quantity: int
+) -> dict:
+    """
+    Estimate when replenishment stock can arrive.
+    """
+    try:
+        delivery_date = get_supplier_delivery_date(
+            request_date,
+            quantity
+        )
+ 
+        return {
+            "success": True,
+            "quantity": quantity,
+            "request_date": request_date,
+            "delivery_date": delivery_date
+        }
+ 
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+def reorder_inventory_tool(
+    item_name: str,
+    quantity: int,
+    unit_price: float,
+    order_date: str
+) -> dict:
+    """
+    Create a stock order transaction to replenish inventory.
+    """
+ 
+    try:
+        total_price = quantity * unit_price
+ 
+        transaction_id = create_transaction(
+            item_name=item_name,
+            transaction_type="stock_orders",
+            quantity=quantity,
+            price=total_price,
+            date_str=order_date
+        )
+ 
+        delivery_date = get_supplier_delivery_date(
+            order_date,
+            quantity
+        )
+ 
+        return {
+            "success": True,
+            "transaction_id": transaction_id,
+            "item_name": item_name,
+            "quantity": quantity,
+            "total_price": total_price,
+            "delivery_date": delivery_date
+        }
+ 
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 # Tools for quoting agent
+def quote_history_tool(
+    search_terms: List[str],
+    limit: int = 5
+) -> dict:
+    """
+    Find relevant historical customer quotes.
+    """
+ 
+    try:
+        quotes = search_quote_history(
+            search_terms=search_terms,
+            limit=limit
+        )
+ 
+        return {
+            "success": True,
+            "search_terms": search_terms,
+            "quotes": quotes
+        }
+ 
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
+def cash_balance_tool(as_of_date: str) -> dict:
+    """
+    Get the company's available cash balance.
+    """
+ 
+    try:
+        balance = get_cash_balance(as_of_date)
+ 
+        return {
+            "success": True,
+            "as_of_date": as_of_date,
+            "cash_balance": balance
+        }
+ 
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+def financial_report_tool(as_of_date: str) -> dict:
+    """
+    Generate the company's financial and inventory report.
+    """
+ 
+    try:
+        report = generate_financial_report(as_of_date)
+ 
+        return {
+            "success": True,
+            "report": report
+        }
+ 
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+def fulfill_order_tool(
+    item_name: str,
+    quantity: int,
+    total_price: float,
+    sale_date: str
+) -> dict:
+    """
+    Record a completed customer sale.
+    """
+ 
+    try:
+        stock_df = get_stock_level(
+            item_name,
+            sale_date
+        )
+ 
+        if stock_df.empty:
+            return {
+                "success": False,
+                "message": "Item not found."
+            }
+ 
+        available_stock = int(
+            stock_df.iloc[0]["current_stock"]
+        )
+ 
+        if available_stock < quantity:
+            return {
+                "success": False,
+                "message": "Insufficient inventory.",
+                "available_stock": available_stock,
+                "requested_quantity": quantity
+            }
+ 
+        transaction_id = create_transaction(
+            item_name=item_name,
+            transaction_type="sales",
+            quantity=quantity,
+            price=total_price,
+            date=sale_date
+        )
+ 
+        return {
+            "success": True,
+            "transaction_id": transaction_id,
+            "item_name": item_name,
+            "quantity": quantity,
+            "total_price": total_price
+        }
+ 
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 # Tools for ordering agent
 
 
 # Set up your agents and create an orchestration agent that will manage them.
+# Inventory Agent-
+def inventory_agent(
+    item_name: str,
+    quantity: int,
+    request_date: str
+) -> dict:
+    """
+    Inventory Agent:
+    Checks whether enough inventory exists for a customer request.
+    If stock is insufficient, estimates replenishment requirements
+    and supplier delivery date.
+    """
+ 
+    stock_result = inventory_lookup_tool(
+        item_name=item_name,
+        as_of_date=request_date
+    )
+ 
+    if not stock_result.get("success"):
+        return {
+            "agent": "inventory_agent",
+            "status": "error",
+            "message": stock_result.get(
+                "message",
+                stock_result.get("error", "Unable to check inventory")
+            )
+        }
+ 
+    available_stock = stock_result["current_stock"]
+ 
+    # Enough inventory
+    if available_stock >= quantity:
+        return {
+            "agent": "inventory_agent",
+            "status": "available",
+            "item_name": item_name,
+            "requested_quantity": quantity,
+            "available_stock": available_stock,
+            "shortage": 0,
+            "requires_reorder": False,
+            "delivery_date": request_date
+        }
+ 
+    # Not enough inventory
+    shortage = quantity - available_stock
+ 
+    delivery_result = supplier_delivery_tool(
+        request_date=request_date,
+        quantity=shortage
+    )
+ 
+    return {
+        "agent": "inventory_agent",
+        "status": "reorder_required",
+        "item_name": item_name,
+        "requested_quantity": quantity,
+        "available_stock": available_stock,
+        "shortage": shortage,
+        "requires_reorder": True,
+        "delivery_date": delivery_result.get("delivery_date")
+    }
 
+# Quote Agent
+def quote_agent(
+    customer_request: str,
+    item_name: str,
+    quantity: int,
+    request_date: str,
+    inventory_result: dict
+) -> dict:
+    """
+    Quote Agent:
+    Uses historical quote information and inventory availability
+    to prepare information needed for a customer quote.
+    """
+ 
+    # Search previous quotes using useful terms
+    search_terms = [
+        item_name,
+        customer_request
+    ]
+ 
+    history_result = quote_history_tool(
+        search_terms=search_terms,
+        limit=5
+    )
+ 
+    historical_quotes = []
+ 
+    if history_result.get("success"):
+        historical_quotes = history_result.get("quotes", [])
+ 
+    return {
+        "agent": "quote_agent",
+        "status": "quote_prepared",
+        "item_name": item_name,
+        "quantity": quantity,
+        "request_date": request_date,
+        "inventory_status": inventory_result.get("status"),
+        "available_stock": inventory_result.get(
+            "available_stock", 0
+        ),
+        "delivery_date": inventory_result.get(
+            "delivery_date"
+        ),
+        "historical_quotes": historical_quotes
+    }
+
+# Sales/Financial Agent
+def sales_agent(
+    item_name: str,
+    quantity: int,
+    total_price: float,
+    request_date: str,
+    inventory_result: dict
+) -> dict:
+    """
+    Sales Agent:
+    Validates inventory availability and records a sale
+    when the order can be fulfilled.
+    """
+ 
+    # Do not complete sale if inventory is unavailable
+    if inventory_result.get("requires_reorder"):
+        return {
+            "agent": "sales_agent",
+            "status": "pending_inventory",
+            "message": (
+                "Sale cannot be completed immediately because "
+                "additional inventory is required."
+            ),
+            "expected_delivery_date":
+                inventory_result.get("delivery_date")
+        }
+ 
+    sale_result = fulfill_order_tool(
+        item_name=item_name,
+        quantity=quantity,
+        total_price=total_price,
+        sale_date=request_date
+    )
+ 
+    if sale_result.get("success"):
+        return {
+            "agent": "sales_agent",
+            "status": "completed",
+            "transaction": sale_result
+        }
+ 
+    return {
+        "agent": "sales_agent",
+        "status": "failed",
+        "details": sale_result
+    }
+
+# Orchestrator Agent
+ 
+def orchestrator_agent(
+    customer_request: str,
+    item_name: str,
+    quantity: int,
+    request_date: str,
+    total_price: float = 0.0
+) -> dict:
+    """
+    Orchestrator Agent:
+    Coordinates Inventory, Quote, and Sales agents
+    to process a customer request.
+    """
+ 
+    # 1. Inventory Agent
+ 
+    inventory_result = inventory_agent(
+        item_name=item_name,
+        quantity=quantity,
+        request_date=request_date
+    )
+ 
+    if inventory_result.get("status") == "error":
+        return {
+            "status": "failed",
+            "stage": "inventory",
+            "details": inventory_result
+        }
+ 
+    # 2. Quote Agent
+ 
+    quote_result = quote_agent(
+        customer_request=customer_request,
+        item_name=item_name,
+        quantity=quantity,
+        request_date=request_date,
+        inventory_result=inventory_result
+    )
+ 
+    # 3. Sales Agent
+ 
+    sales_result = sales_agent(
+        item_name=item_name,
+        quantity=quantity,
+        total_price=total_price,
+        request_date=request_date,
+        inventory_result=inventory_result
+    )
+ 
+    # Final coordinated response
+ 
+    return {
+        "status": "processed",
+        "inventory": inventory_result,
+        "quote": quote_result,
+        "sales": sales_result
+    }
+ 
+
+def call_your_multi_agent_system(request_with_date: str) -> dict:
+    """
+    Main entry point for the multi-agent system.
+ 
+    Accepts a natural-language customer request containing
+    the request date and routes it through the appropriate agents.
+    """
+ 
+    try:
+        print("\n=== MULTI-AGENT SYSTEM ===")
+        print(f"Customer request: {request_with_date}")
+ 
+        # Normalize request
+        request_text = str(request_with_date).strip()
+ 
+        if not request_text:
+            return {
+                "success": False,
+                "status": "invalid_request",
+                "response": "Customer request is empty."
+            }
+ 
+        # Extract quantity from request
+        import re
+ 
+        quantity_match = re.search(
+            r"\b(\d+)\b",
+            request_text
+        )
+ 
+        quantity = (
+            int(quantity_match.group(1))
+            if quantity_match
+            else 1
+        )
+ 
+        # Identify inventory item
+        inventory = get_all_inventory(
+            as_of_date=datetime.now().isoformat()
+        )
+ 
+        item_name = None
+ 
+        for inventory_item in inventory.keys():
+            if inventory_item.lower() in request_text.lower():
+                item_name = inventory_item
+                break
+ 
+        # If exact inventory name was not found
+        if item_name is None:
+            return {
+                "success": False,
+                "status": "item_not_found",
+                "response": (
+                    "Unable to identify the requested paper "
+                    "type from the customer request."
+                )
+            }
+ 
+        # Extract request date
+        date_match = re.search(
+            r"\d{4}-\d{2}-\d{2}",
+            request_text
+        )
+ 
+        if date_match:
+            request_date = date_match.group(0)
+        else:
+            request_date = datetime.now().strftime("%Y-%m-%d")
+ 
+        # Call orchestrator
+        result = orchestrator_agent(
+            customer_request=request_text,
+            item_name=item_name,
+            quantity=quantity,
+            request_date=request_date,
+            total_price=0.0
+        )
+ 
+        return {
+            "success": True,
+            "status": "completed",
+            "response": result
+        }
+ 
+    except Exception as e:
+ 
+        print(f"ERROR in multi-agent system: {e}")
+ 
+        return {
+            "success": False,
+            "status": "error",
+            "response": str(e)
+        }
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
 
 def run_test_scenarios():
     
     print("Initializing Database...")
-    init_database()
+    init_database(db_engine)
     try:
         quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
         quote_requests_sample["request_date"] = pd.to_datetime(
@@ -660,7 +1203,7 @@ def run_test_scenarios():
         ############
         ############
 
-        # response = call_your_multi_agent_system(request_with_date)
+        response = call_your_multi_agent_system(request_with_date)
 
         # Update state
         report = generate_financial_report(request_date)
@@ -683,6 +1226,69 @@ def run_test_scenarios():
 
         time.sleep(1)
 
+    # STEP 5 - TEST AND EVALUATE IMPLEMENTATION
+ 
+    evaluation_results = []
+ 
+    for result in results:
+        response = result.get("response", {})
+ 
+    sales = {}
+ 
+    if isinstance(response, dict):
+        inner_response = response.get("response", response)
+ 
+        if isinstance(inner_response, dict):
+            sales = inner_response.get("sales", {})
+ 
+    sales_status = sales.get("status", "unknown")
+    reason = sales.get("message", "")
+ 
+    fulfilled = sales_status in [
+        "completed",
+        "sale_completed",
+        "success"
+    ]
+ 
+    evaluation_results.append({
+        "request_id": result.get("request_id"),
+        "request_date": result.get("request_date"),
+        "sales_status": sales_status,
+        "fulfilled": fulfilled,
+        "rejected_or_unfulfilled": not fulfilled,
+        "reason": reason,
+        "cash_balance": result.get("cash_balance"),
+        "inventory_value": result.get("inventory_value")
+    })
+ 
+    evaluation_df = pd.DataFrame(evaluation_results)
+    
+    # Create required Step 5 file
+    evaluation_df.to_csv("test_results.csv", index=False)
+    
+    fulfilled_count = int(evaluation_df["fulfilled"].sum())
+    unfulfilled_count = len(evaluation_df) - fulfilled_count
+    
+    print("\n" + "=" * 60)
+    print("STEP 5 - EVALUATION SUMMARY")
+    print("=" * 60)
+    
+    print(f"Total requests tested: {len(evaluation_df)}")
+    print(f"Successfully fulfilled: {fulfilled_count}")
+    print(f"Rejected/unfulfilled: {unfulfilled_count}")
+    
+    print(
+        "At least 3 fulfilled:",
+        "PASS" if fulfilled_count >= 3 else "FAIL"
+    )
+    
+    print(
+        "At least 1 rejected/unfulfilled:",
+        "PASS" if unfulfilled_count >= 1 else "FAIL"
+    )
+    
+    print("\nCreated: test_results.csv")
+ 
     # Final report
     final_date = quote_requests_sample["request_date"].max().strftime("%Y-%m-%d")
     final_report = generate_financial_report(final_date)
@@ -694,6 +1300,13 @@ def run_test_scenarios():
     pd.DataFrame(results).to_csv("test_results.csv", index=False)
     return results
 
-
 if __name__ == "__main__":
     results = run_test_scenarios()
+    init_database(db_engine)
+    # test_request = (
+    #     "I need 500 sheets of A4 paper. "
+    #     "Request date: 2025-01-15"
+    # )
+
+    print("\n========== TEST RESULT ==========")
+    pprint.pprint(results, width=100, sort_dicts=False)
