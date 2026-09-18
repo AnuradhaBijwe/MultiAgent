@@ -5,6 +5,8 @@ import time
 import dotenv
 import ast
 import pprint
+import json
+from openai import OpenAI
 from sqlalchemy.sql import text
 from datetime import datetime, timedelta
 from typing import Dict, List, Union
@@ -592,8 +594,188 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 
 # Set up and load your env parameters and instantiate your model.
 # Load environment variables
-dotenv.load_dotenv()
+dotenv.load_dotenv("config.env")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL")
  
+client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    base_url=OPENAI_BASE_URL
+)
+print("API key loaded:", bool(os.getenv("OPENAI_API_KEY")))
+print("Base URL:", os.getenv("OPENAI_BASE_URL"))
+print("Model:", os.getenv("OPENAI_MODEL"))
+
+def run_llm_agent(system_prompt, user_request, tools, tool_functions):
+    """
+    Run an LLM-powered agent.
+ 
+    The LLM decides which available tool to call based on
+    the request and the results returned by previous tool calls.
+    """
+ 
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt
+        },
+        {
+            "role": "user",
+            "content": user_request
+        }
+    ]
+ 
+    while True:
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto"
+        )
+ 
+        message = response.choices[0].message
+        messages.append(message)
+ 
+        # No tool call means the LLM has finished its task
+    if not message.tool_calls:
+        content = message.content
+ 
+    try:
+        result = json.loads(content)
+ 
+        # Handle a response that was JSON encoded twice
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except (json.JSONDecodeError, TypeError):
+                pass
+ 
+        return result
+ 
+    except (json.JSONDecodeError, TypeError):
+        return {
+            "status": "completed",
+            "message": content
+        }
+ 
+        # Execute only the tools selected by the LLM
+        for tool_call in message.tool_calls:
+ 
+            tool_name = tool_call.function.name
+ 
+            arguments = json.loads(
+                tool_call.function.arguments
+            )
+ 
+            print(f"\nLLM selected tool: {tool_name}")
+            print(f"Tool arguments: {arguments}")
+
+            if tool_name not in tool_functions:
+                result = {
+                    "success": False,
+                    "error": f"Unknown tool: {tool_name}"
+                }
+            else:
+                result = tool_functions[tool_name](**arguments)
+ 
+            # Give the tool result back to the LLM
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(
+                        result,
+                        default=str
+                    )
+                }
+            )
+# ---------------------------------------------------------
+# Inventory Agent - LLM Tool Definitions
+# ---------------------------------------------------------
+ 
+INVENTORY_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "check_inventory",
+            "description": (
+                "Check the current stock level for a specific item "
+                "as of a given date."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_name": {
+                        "type": "string",
+                        "description": "Name of the paper product"
+                    },
+                    "as_of_date": {
+                        "type": "string",
+                        "description": "Date to check inventory in YYYY-MM-DD format"
+                    }
+                },
+                "required": ["item_name", "as_of_date"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_supplier_delivery",
+            "description": (
+                "Determine the expected supplier delivery date "
+                "when additional inventory is required."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "input_date_str": {
+                        "type": "string",
+                        "description": "Request date in YYYY-MM-DD format"
+                    },
+                    "quantity": {
+                        "type": "integer",
+                        "description": "Quantity of additional stock required"
+                    }
+                },
+                "required": ["input_date_str", "quantity"]
+            }
+        }
+    }
+]
+
+# Wrapper 1
+def check_inventory(item_name, as_of_date):
+    stock = get_stock_level(
+        item_name=item_name,
+        as_of_date=as_of_date
+    )
+ 
+    return {
+        "success": True,
+        "item_name": item_name,
+        "current_stock": stock
+    }
+ 
+# Wrapper 2
+def check_supplier_delivery(input_date_str, quantity):
+    delivery_date = get_supplier_delivery_date(
+        input_date_str=input_date_str,
+        quantity=quantity
+    )
+ 
+    return {
+        "success": True,
+        "delivery_date": str(delivery_date)
+    }
+
+# MApping
+INVENTORY_TOOL_FUNCTIONS = {
+    "check_inventory": check_inventory,
+    "check_supplier_delivery": check_supplier_delivery
+}
+
 # Database and model configuration will be shared
 # across all specialized agents.
 """Set up tools for your agents to use, these should be methods that combine the database functions above
@@ -846,155 +1028,539 @@ def inventory_agent(
     item_name: str,
     quantity: int,
     request_date: str
-) -> dict:
+):
     """
-    Inventory Agent:
-    Checks whether enough inventory exists for a customer request.
-    If stock is insufficient, estimates replenishment requirements
-    and supplier delivery date.
+    LLM-powered Inventory Agent.
+ 
+    The LLM decides which inventory tools to call based on
+    the request and the results returned by the tools.
     """
+    system_prompt = """
+2. Compare the current_stock returned by check_inventory with
+   the requested quantity.
  
-    stock_result = inventory_lookup_tool(
-        item_name=item_name,
-        as_of_date=request_date
-    )
+3. If current_stock is greater than or equal to the requested
+   quantity:
+   - DO NOT call check_supplier_delivery.
+   - Set shortage to 0.
+   - Set requires_reorder to false.
+   - Set delivery_date to null.
+   - Set status to "available".
  
-    if not stock_result.get("success"):
-        return {
-            "agent": "inventory_agent",
-            "status": "error",
-            "message": stock_result.get(
-                "message",
-                stock_result.get("error", "Unable to check inventory")
-            )
-        }
+4. Only if current_stock is less than the requested quantity:
+   - Calculate shortage as requested quantity minus current_stock.
+   - Call check_supplier_delivery using exactly that shortage
+     quantity.
+   - Set requires_reorder to true.
+   - Set status to "reorder_required".
  
-    available_stock = stock_result["current_stock"]
- 
-    # Enough inventory
-    if available_stock >= quantity:
-        return {
-            "agent": "inventory_agent",
-            "status": "available",
-            "item_name": item_name,
-            "requested_quantity": quantity,
-            "available_stock": available_stock,
-            "shortage": 0,
-            "requires_reorder": False,
-            "delivery_date": request_date
-        }
- 
-    # Not enough inventory
-    shortage = quantity - available_stock
- 
-    delivery_result = supplier_delivery_tool(
-        request_date=request_date,
-        quantity=shortage
-    )
- 
-    return {
-        "agent": "inventory_agent",
-        "status": "reorder_required",
-        "item_name": item_name,
-        "requested_quantity": quantity,
-        "available_stock": available_stock,
-        "shortage": shortage,
-        "requires_reorder": True,
-        "delivery_date": delivery_result.get("delivery_date")
-    }
+5. NEVER call check_supplier_delivery with quantity 0.
+"""
 
-# Quote Agent
+    user_request = f"""
+    Item name: {item_name}
+    Requested quantity: {quantity}
+    Request date: {request_date}
+ 
+    Determine whether this request can be fulfilled from inventory.
+    """
+    return run_llm_agent(
+        system_prompt=system_prompt,
+        user_request=user_request,
+        tools=INVENTORY_TOOLS,
+        tool_functions=INVENTORY_TOOL_FUNCTIONS
+    )
+
+
+ # ALM Agent
+
+def run_llm_agent(system_prompt, user_request, tools, tool_functions):
+    """
+    Runs an LLM-powered agent and allows the LLM
+    to dynamically decide which available tool to use.
+    """
+ 
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt
+        },
+        {
+            "role": "user",
+            "content": user_request
+        }
+    ]
+ 
+    while True:
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto"
+        )
+ 
+        message = response.choices[0].message
+        messages.append(message)
+ 
+        # If the LLM does not request another tool,
+        # the agent has finished.
+        if not message.tool_calls:
+            return message.content
+ 
+        for tool_call in message.tool_calls:
+            tool_name = tool_call.function.name
+            arguments = json.loads(
+                tool_call.function.arguments
+            )
+ 
+            if tool_name not in tool_functions:
+                result = {
+                    "success": False,
+                    "error": f"Unknown tool: {tool_name}"
+                }
+            else:
+                result = tool_functions[tool_name](**arguments)
+ 
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(result, default=str)
+                }
+            )
+
+# ---------------------------------------------------------
+# Quote Agent - LLM Tool Definitions
+# ---------------------------------------------------------
+ 
+QUOTE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_quote_history",
+            "description": (
+                "Search historical customer quotes for similar paper "
+                "products and requests. Use the results to help prepare "
+                "an appropriate customer quote."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "search_terms": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Terms to use when searching historical quotes, "
+                            "such as the item name and customer request."
+                        )
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of historical quotes to return"
+                    }
+                },
+                "required": ["search_terms"]
+            }
+        }
+    }
+]
+# Wrapper
+def search_quote_history(search_terms, limit=5):
+    return quote_history_tool(
+        search_terms=search_terms,
+        limit=limit
+    )
+
+# MAppings
+QUOTE_TOOL_FUNCTIONS = {
+    "search_quote_history": search_quote_history
+}
+
 def quote_agent(
     customer_request: str,
     item_name: str,
     quantity: int,
     request_date: str,
     inventory_result: dict
-) -> dict:
+):
     """
-    Quote Agent:
-    Uses historical quote information and inventory availability
-    to prepare information needed for a customer quote.
+    LLM-powered Quote Agent.
+ 
+    The LLM decides when historical quote information is needed
+    and uses the available quote tools to prepare the quote.
     """
  
-    # Search previous quotes using useful terms
-    search_terms = [
-        item_name,
-        customer_request
-    ]
+    system_prompt = """
+You are the Quote Agent for a paper supply company.
  
-    history_result = quote_history_tool(
-        search_terms=search_terms,
-        limit=5
+Your responsibility is to prepare customer quote information.
+ 
+You have access to a tool that searches historical quotes.
+ 
+Follow these rules:
+ 
+1. Review the customer's request, item, quantity, request date,
+   and inventory information.
+ 
+2. Use the search_quote_history tool when historical quote
+   information would help prepare the quote.
+ 
+3. Choose useful search terms based on the customer's request
+   and item name.
+ 
+4. Use the historical quote results when preparing the response.
+ 
+5. Do not check or modify inventory yourself. Inventory
+   information is supplied to you.
+ 
+6. Do not fulfill or record a sale.
+ 
+7. Do not invent historical quote information. Use the tool
+   when historical information is needed.
+ 
+Return the final result as valid JSON only.
+ 
+Use this structure:
+ 
+{
+    "agent": "quote_agent",
+    "status": "quote_prepared",
+    "item_name": "product name",
+    "quantity": 0,
+    "request_date": "YYYY-MM-DD",
+    "inventory_result": {},
+    "historical_quotes": [],
+    "message": "quote information"
+}
+"""
+ 
+    user_request = f"""
+Customer request: {customer_request}
+ 
+Item name: {item_name}
+Quantity: {quantity}
+Request date: {request_date}
+ 
+Inventory information:
+{json.dumps(inventory_result, default=str)}
+ 
+Prepare the quote information for this customer.
+"""
+ 
+    return run_llm_agent(
+        system_prompt=system_prompt,
+        user_request=user_request,
+        tools=QUOTE_TOOLS,
+        tool_functions=QUOTE_TOOL_FUNCTIONS
     )
- 
-    historical_quotes = []
- 
-    if history_result.get("success"):
-        historical_quotes = history_result.get("quotes", [])
- 
-    return {
-        "agent": "quote_agent",
-        "status": "quote_prepared",
-        "item_name": item_name,
-        "quantity": quantity,
-        "request_date": request_date,
-        "inventory_status": inventory_result.get("status"),
-        "available_stock": inventory_result.get(
-            "available_stock", 0
-        ),
-        "delivery_date": inventory_result.get(
-            "delivery_date"
-        ),
-        "historical_quotes": historical_quotes
-    }
 
-# Sales/Financial Agent
+# ---------------------------------------------------------
+# Sales Agent - LLM Tool Definitions
+# ---------------------------------------------------------
+ 
+SALES_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "fulfill_order",
+            "description": (
+                "Fulfill and record a customer order. "
+                "Use this tool only when the supplied inventory "
+                "information confirms that the order can be fulfilled."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_name": {
+                        "type": "string",
+                        "description": "Name of the paper product"
+                    },
+                    "quantity": {
+                        "type": "integer",
+                        "description": "Quantity being purchased"
+                    },
+                    "total_price": {
+                        "type": "number",
+                        "description": "Total price of the order"
+                    },
+                    "sale_date": {
+                        "type": "string",
+                        "description": "Date of the sale in YYYY-MM-DD format"
+                    }
+                },
+                "required": [
+                    "item_name",
+                    "quantity",
+                    "total_price",
+                    "sale_date"
+                ]
+            }
+        }
+    }
+]
+
+# Wrapper
+def fulfill_customer_order(
+    item_name,
+    quantity,
+    total_price,
+    sale_date
+):
+    return fulfill_order_tool(
+        item_name=item_name,
+        quantity=quantity,
+        total_price=total_price,
+        sale_date=sale_date
+    )
+# Mappings
+SALES_TOOL_FUNCTIONS = {
+    "fulfill_order": fulfill_customer_order
+}
+
 def sales_agent(
     item_name: str,
     quantity: int,
     total_price: float,
     request_date: str,
     inventory_result: dict
-) -> dict:
+):
     """
-    Sales Agent:
-    Validates inventory availability and records a sale
-    when the order can be fulfilled.
+    LLM-powered Sales Agent.
+ 
+    The LLM reviews the inventory information and decides
+    whether the order fulfillment tool should be called.
     """
  
-    # Do not complete sale if inventory is unavailable
-    if inventory_result.get("requires_reorder"):
-        return {
-            "agent": "sales_agent",
-            "status": "pending_inventory",
-            "message": (
-                "Sale cannot be completed immediately because "
-                "additional inventory is required."
-            ),
-            "expected_delivery_date":
-                inventory_result.get("delivery_date")
-        }
+    system_prompt = """
+You are the Sales Agent for a paper supply company.
  
-    sale_result = fulfill_order_tool(
+Your responsibility is to determine whether a customer order
+can be fulfilled and, when appropriate, record the sale.
+ 
+You have access to the fulfill_order tool.
+ 
+Follow these rules:
+ 
+1. Carefully review the supplied inventory information.
+ 
+2. If the inventory information confirms that sufficient stock
+   is currently available and no reorder is required, use the
+   fulfill_order tool to complete the order.
+ 
+3. If inventory is insufficient, requires a reorder, or cannot
+   currently satisfy the requested quantity, DO NOT call the
+   fulfill_order tool.
+ 
+4. You must decide whether the fulfill_order tool should be
+   called based on the supplied information.
+ 
+5. Never invent inventory availability.
+ 
+6. Never fulfill an order when the inventory information says
+   additional inventory is required.
+ 
+Return the final result as valid JSON only.
+ 
+For a completed order, return information similar to:
+ 
+{
+    "agent": "sales_agent",
+    "status": "completed",
+    "message": "Order successfully fulfilled"
+}
+ 
+For an order that cannot currently be fulfilled, return:
+ 
+{
+    "agent": "sales_agent",
+    "status": "pending_inventory",
+    "message": "Order cannot currently be fulfilled",
+    "expected_delivery_date": null
+}
+"""
+ 
+    user_request = f"""
+Item name: {item_name}
+Quantity: {quantity}
+Total price: {total_price}
+Request date: {request_date}
+ 
+Inventory information:
+{json.dumps(inventory_result, default=str)}
+ 
+Determine whether this order can be fulfilled.
+If appropriate, use the available fulfillment tool.
+"""
+ 
+    return run_llm_agent(
+        system_prompt=system_prompt,
+        user_request=user_request,
+        tools=SALES_TOOLS,
+        tool_functions=SALES_TOOL_FUNCTIONS
+    )
+ 
+
+# ---------------------------------------------------------
+# Orchestrator - Agent Delegation Wrappers
+# ---------------------------------------------------------
+ 
+def delegate_to_inventory_agent(
+    item_name,
+    quantity,
+    request_date
+):
+    return inventory_agent(
+        item_name=item_name,
+        quantity=quantity,
+        request_date=request_date
+    )
+ 
+ 
+def delegate_to_quote_agent(
+    customer_request,
+    item_name,
+    quantity,
+    request_date,
+    inventory_result
+):
+    return quote_agent(
+        customer_request=customer_request,
+        item_name=item_name,
+        quantity=quantity,
+        request_date=request_date,
+        inventory_result=inventory_result
+    )
+ 
+ 
+def delegate_to_sales_agent(
+    item_name,
+    quantity,
+    total_price,
+    request_date,
+    inventory_result
+):
+    return sales_agent(
         item_name=item_name,
         quantity=quantity,
         total_price=total_price,
-        sale_date=request_date
+        request_date=request_date,
+        inventory_result=inventory_result
     )
- 
-    if sale_result.get("success"):
-        return {
-            "agent": "sales_agent",
-            "status": "completed",
-            "transaction": sale_result
+# Tool definition
+ORCHESTRATOR_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "inventory_agent",
+            "description": (
+                "Delegate inventory checking and supplier delivery "
+                "decisions to the Inventory Agent."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_name": {
+                        "type": "string"
+                    },
+                    "quantity": {
+                        "type": "integer"
+                    },
+                    "request_date": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "item_name",
+                    "quantity",
+                    "request_date"
+                ]
+            }
         }
+    },
  
-    return {
-        "agent": "sales_agent",
-        "status": "failed",
-        "details": sale_result
+    {
+        "type": "function",
+        "function": {
+            "name": "quote_agent",
+            "description": (
+                "Delegate quote preparation and historical quote "
+                "analysis to the Quote Agent."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "customer_request": {
+                        "type": "string"
+                    },
+                    "item_name": {
+                        "type": "string"
+                    },
+                    "quantity": {
+                        "type": "integer"
+                    },
+                    "request_date": {
+                        "type": "string"
+                    },
+                    "inventory_result": {
+                        "type": "object"
+                    }
+                },
+                "required": [
+                    "customer_request",
+                    "item_name",
+                    "quantity",
+                    "request_date",
+                    "inventory_result"
+                ]
+            }
+        }
+    },
+ 
+    {
+        "type": "function",
+        "function": {
+            "name": "sales_agent",
+            "description": (
+                "Delegate order fulfillment decisions and sales "
+                "processing to the Sales Agent."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_name": {
+                        "type": "string"
+                    },
+                    "quantity": {
+                        "type": "integer"
+                    },
+                    "total_price": {
+                        "type": "number"
+                    },
+                    "request_date": {
+                        "type": "string"
+                    },
+                    "inventory_result": {
+                        "type": "object"
+                    }
+                },
+                "required": [
+                    "item_name",
+                    "quantity",
+                    "total_price",
+                    "request_date",
+                    "inventory_result"
+                ]
+            }
+        }
     }
+]
+
+# Mapping
+ORCHESTRATOR_TOOL_FUNCTIONS = {
+    "inventory_agent": delegate_to_inventory_agent,
+    "quote_agent": delegate_to_quote_agent,
+    "sales_agent": delegate_to_sales_agent
+}
 
 # Orchestrator Agent
  
@@ -1006,54 +1572,74 @@ def orchestrator_agent(
     total_price: float = 0.0
 ) -> dict:
     """
-    Orchestrator Agent:
-    Coordinates Inventory, Quote, and Sales agents
-    to process a customer request.
+    LLM-powered Orchestrator Agent.
+ 
+    The LLM decides which specialized agent to delegate to
+    and when based on the customer request and agent results.
     """
  
-    # 1. Inventory Agent
+    system_prompt = """
+You are the Orchestrator Agent for a paper supply company.
  
-    inventory_result = inventory_agent(
-        item_name=item_name,
-        quantity=quantity,
-        request_date=request_date
-    )
+Your responsibility is to understand the customer's request
+and coordinate the appropriate specialized agents.
  
-    if inventory_result.get("status") == "error":
-        return {
-            "status": "failed",
-            "stage": "inventory",
-            "details": inventory_result
-        }
+You have access to three specialized agents as tools:
  
-    # 2. Quote Agent
+1. inventory_agent
+   Use this agent when inventory availability or supplier
+   delivery information is required.
  
-    quote_result = quote_agent(
-        customer_request=customer_request,
-        item_name=item_name,
-        quantity=quantity,
-        request_date=request_date,
-        inventory_result=inventory_result
-    )
+2. quote_agent
+   Use this agent when quote preparation or historical quote
+   information is required.
  
-    # 3. Sales Agent
+3. sales_agent
+   Use this agent when an order may be ready for fulfillment.
  
-    sales_result = sales_agent(
-        item_name=item_name,
-        quantity=quantity,
-        total_price=total_price,
-        request_date=request_date,
-        inventory_result=inventory_result
-    )
+IMPORTANT:
  
-    # Final coordinated response
+You must decide which specialized agent to call and when.
  
-    return {
-        "status": "processed",
-        "inventory": inventory_result,
-        "quote": quote_result,
-        "sales": sales_result
-    }
+Do NOT automatically call Inventory, Quote, and Sales in a
+hard-coded sequence.
+ 
+Use the results returned by one agent to decide whether another
+agent needs to be called.
+ 
+When calling another agent, pass relevant results from previously
+called agents to that agent.
+ 
+Do not perform inventory checks yourself.
+Do not search quote history yourself.
+Do not process sales yourself.
+ 
+Delegate those responsibilities to the appropriate specialized
+agent.
+ 
+Do not invent tool or agent results.
+ 
+When the customer's request has been completely handled,
+return the final response as valid JSON only.
+"""
+ 
+    user_request = f"""
+Customer request: {customer_request}
+Item name: {item_name}
+Quantity: {quantity}
+Request date: {request_date}
+Total price: {total_price}
+ 
+Determine which specialized agents are required to handle
+this customer request and coordinate them appropriately.
+"""
+ 
+    return run_llm_agent(
+    system_prompt=system_prompt,
+    user_request=user_request,
+    tools=ORCHESTRATOR_TOOLS,
+    tool_functions=ORCHESTRATOR_TOOL_FUNCTIONS
+)
  
 
 def call_your_multi_agent_system(request_with_date: str) -> dict:
@@ -1154,159 +1740,70 @@ def call_your_multi_agent_system(request_with_date: str) -> dict:
 # Run your test scenarios by writing them here. Make sure to keep track of them.
 
 def run_test_scenarios():
-    
-    print("Initializing Database...")
-    init_database(db_engine)
-    try:
-        quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
-        quote_requests_sample["request_date"] = pd.to_datetime(
-            quote_requests_sample["request_date"], format="%m/%d/%y", errors="coerce"
-        )
-        quote_requests_sample.dropna(subset=["request_date"], inplace=True)
-        quote_requests_sample = quote_requests_sample.sort_values("request_date")
-    except Exception as e:
-        print(f"FATAL: Error loading test data: {e}")
-        return
-
-    # Get initial state
-    initial_date = quote_requests_sample["request_date"].min().strftime("%Y-%m-%d")
-    report = generate_financial_report(initial_date)
-    current_cash = report["cash_balance"]
-    current_inventory = report["inventory_value"]
-
-    ############
-    ############
-    ############
-    # INITIALIZE YOUR MULTI AGENT SYSTEM HERE
-    ############
-    ############
-    ############
-
-    results = []
-    for idx, row in quote_requests_sample.iterrows():
-        request_date = row["request_date"].strftime("%Y-%m-%d")
-
-        print(f"\n=== Request {idx+1} ===")
-        print(f"Context: {row['job']} organizing {row['event']}")
-        print(f"Request Date: {request_date}")
-        print(f"Cash Balance: ${current_cash:.2f}")
-        print(f"Inventory Value: ${current_inventory:.2f}")
-
-        # Process request
-        request_with_date = f"{row['request']} (Date of request: {request_date})"
-
-        ############
-        ############
-        ############
-        # USE YOUR MULTI AGENT SYSTEM TO HANDLE THE REQUEST
-        ############
-        ############
-        ############
-
-        response = call_your_multi_agent_system(request_with_date)
-
-        # Update state
-        report = generate_financial_report(request_date)
-        current_cash = report["cash_balance"]
-        current_inventory = report["inventory_value"]
-
-        print(f"Response: {response}")
-        print(f"Updated Cash: ${current_cash:.2f}")
-        print(f"Updated Inventory: ${current_inventory:.2f}")
-
-        results.append(
-            {
-                "request_id": idx + 1,
-                "request_date": request_date,
-                "cash_balance": current_cash,
-                "inventory_value": current_inventory,
-                "response": response,
-            }
-        )
-
-        time.sleep(1)
-
-    # STEP 5 - TEST AND EVALUATE IMPLEMENTATION
+    """
+    Run end-to-end scenarios through the LLM-powered orchestrator.
+    """
  
-    evaluation_results = []
- 
-    for result in results:
-        response = result.get("response", {})
- 
-    sales = {}
- 
-    if isinstance(response, dict):
-        inner_response = response.get("response", response)
- 
-        if isinstance(inner_response, dict):
-            sales = inner_response.get("sales", {})
- 
-    sales_status = sales.get("status", "unknown")
-    reason = sales.get("message", "")
- 
-    fulfilled = sales_status in [
-        "completed",
-        "sale_completed",
-        "success"
+    scenarios = [
+        {
+            "name": "Available inventory",
+            "customer_request": (
+                "I need a quote for 10 units of A4 paper. "
+                "If enough inventory is available, process the order."
+            ),
+            "item_name": "A4 paper",
+            "quantity": 10,
+            "request_date": "2026-09-18",
+            "total_price": 100.00
+        },
+        {
+            "name": "Insufficient inventory",
+            "customer_request": (
+                "I need 10000 units of A4 paper. "
+                "Check availability and provide a quote. "
+                "Process the order only if enough inventory "
+                "is currently available."
+            ),
+            "item_name": "A4 paper",
+            "quantity": 10000,
+            "request_date": "2026-09-18",
+            "total_price": 100000.00
+        }
     ]
  
-    evaluation_results.append({
-        "request_id": result.get("request_id"),
-        "request_date": result.get("request_date"),
-        "sales_status": sales_status,
-        "fulfilled": fulfilled,
-        "rejected_or_unfulfilled": not fulfilled,
-        "reason": reason,
-        "cash_balance": result.get("cash_balance"),
-        "inventory_value": result.get("inventory_value")
-    })
+    results = []
  
-    evaluation_df = pd.DataFrame(evaluation_results)
-    
-    # Create required Step 5 file
-    evaluation_df.to_csv("test_results.csv", index=False)
-    
-    fulfilled_count = int(evaluation_df["fulfilled"].sum())
-    unfulfilled_count = len(evaluation_df) - fulfilled_count
-    
-    print("\n" + "=" * 60)
-    print("STEP 5 - EVALUATION SUMMARY")
-    print("=" * 60)
-    
-    print(f"Total requests tested: {len(evaluation_df)}")
-    print(f"Successfully fulfilled: {fulfilled_count}")
-    print(f"Rejected/unfulfilled: {unfulfilled_count}")
-    
-    print(
-        "At least 3 fulfilled:",
-        "PASS" if fulfilled_count >= 3 else "FAIL"
-    )
-    
-    print(
-        "At least 1 rejected/unfulfilled:",
-        "PASS" if unfulfilled_count >= 1 else "FAIL"
-    )
-    
-    print("\nCreated: test_results.csv")
+    for scenario in scenarios:
+        print("\n" + "=" * 60)
+        print(f"SCENARIO: {scenario['name']}")
+        print("=" * 60)
  
-    # Final report
-    final_date = quote_requests_sample["request_date"].max().strftime("%Y-%m-%d")
-    final_report = generate_financial_report(final_date)
-    print("\n===== FINAL FINANCIAL REPORT =====")
-    print(f"Final Cash: ${final_report['cash_balance']:.2f}")
-    print(f"Final Inventory: ${final_report['inventory_value']:.2f}")
-
-    # Save results
-    pd.DataFrame(results).to_csv("test_results.csv", index=False)
+        result = orchestrator_agent(
+            customer_request=scenario["customer_request"],
+            item_name=scenario["item_name"],
+            quantity=scenario["quantity"],
+            request_date=scenario["request_date"],
+            total_price=scenario["total_price"]
+        )
+ 
+        results.append(result)
+ 
+        print("\n--- FINAL ORCHESTRATOR RESULT ---")
+        print(json.dumps(result, indent=2, default=str))
+ 
     return results
-
 if __name__ == "__main__":
-    results = run_test_scenarios()
-    init_database(db_engine)
-    # test_request = (
-    #     "I need 500 sheets of A4 paper. "
-    #     "Request date: 2025-01-15"
-    # )
-
-    print("\n========== TEST RESULT ==========")
-    pprint.pprint(results, width=100, sort_dicts=False)
+    test_result = orchestrator_agent(
+        customer_request=(
+            "I need 10000 units of A4 paper. "
+            "Check availability and provide a quote. "
+            "Process the order only if enough inventory is currently available."
+        ),
+        item_name="A4 paper",
+        quantity=10000,
+        request_date="2026-09-18",
+        total_price=100000.00
+    )
+ 
+    print("\n--- ORCHESTRATOR INSUFFICIENT INVENTORY TEST ---")
+    print(json.dumps(test_result, indent=2, default=str))

@@ -1,35 +1,25 @@
-# Multi-Agent Paper Supply System – Agent Workflow
+flowchart LR
  
-```mermaid
-flowchart TD
-    A[Customer Request] --> B[Orchestrator Agent]
+    A[Customer Request] --> B[Orchestrator Agent - LLM]
  
-    B --> C[Inventory Agent]
-    C --> C1[Check Inventory]
-    C --> C2[Get All Inventory]
-    C1 --> D{Inventory Available?}
+    B -->|LLM decides| C[Inventory Agent - LLM]
+    B -->|LLM decides| D[Quote Agent - LLM]
+    B -->|LLM decides| E[Sales Agent - LLM]
  
-    D -->|Yes| E[Quote Agent]
-    D -->|No| F[Check Supplier Delivery Date]
-    F --> E
+    C -->|LLM selects tool| F[Inventory Lookup Tool]
+    C -->|LLM selects when shortage exists| G[Supplier Delivery Tool]
  
-    E --> E1[Get Quote History]
-    E --> E2[Generate Quote]
-    E1 --> E2
+    D -->|LLM selects tool| H[Quote History Search Tool]
  
-    E2 --> G[Sales Agent]
+    E -->|LLM selects when order can be fulfilled| I[Fulfill Order Tool]
  
-    G --> G1[Check Cash Balance]
-    G --> H{Order Can Be Fulfilled?}
+    F --> C
+    G --> C
+    H --> D
+    I --> E
  
-    H -->|Yes| I[Fulfill Order]
-    I --> J[Update Inventory and Financial State]
+    C -->|Agent result| B
+    D -->|Agent result| B
+    E -->|Agent result| B
  
-    H -->|No| K[Unfulfilled Order]
-    K --> K1[Provide Clear Reason]
- 
-    J --> L[Final Customer Response]
-    K1 --> L
- 
-    J --> M[Generate Financial Report]
-```
+    B --> J[Final Customer Response]
