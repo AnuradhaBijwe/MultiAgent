@@ -1,0 +1,63 @@
+Multi-Agent Workflow
+ 
+I designed the agent flow as below based on how a customer request moves through the system.
+ 
+Owner Request
+ 
+Orchestrator Agent
+- receives the request
+- identifies what needs to be done
+- coordinates the other agents
+ 
+ 
+Inventory Agent
+- gets the requested items and quantity
+- gets current inventory
+- checks supplier delivery timeline
+- Tool: Inventory Lookup
+  Helper: get_stock_level
+- Tool: Supplier Delivery
+  Helper: get_supplier_delivery_date
+ 
+ 
+Quote Agent
+- checks previous quote information
+- applies the rules
+- applies pricing/discount logic when required
+- Tool: Quote History Search
+  Helper: search_quote_history
+ 
+ 
+Sales Agent
+- checks whether the order can be completed
+- gets required financial information
+- fulfills the order when possible
+- Tool: Fulfill Order
+  Helper: create_transaction
+ 
+ 
+Final Decision
+ 
+Order can be fulfilled
+→ Complete order
+→ Update inventory/financial data
+ 
+Order cannot be fulfilled
+→ Keep order unfulfilled
+→ Return the reason
+ 
+ 
+Final response to customer
+ 
+ 
+Workflow Note
+ 
+I intentionally planned the agents around the main business activities:
+inventory, quotation, and sales.
+ 
+The inventory check happens before the final sales decision because the system
+needs to know whether the requested items are available and, when necessary,
+when the supplier can deliver them.
+ 
+Each tool in the architecture diagram is labeled with both its business purpose
+and the corresponding starter-code helper function.
