@@ -618,6 +618,27 @@ print("Model:", os.getenv("OPENAI_MODEL"))
 
 # Wrapper 1
 @tool
+def all_inventory_tool(as_of_date: str) -> dict:
+    """
+    Return all available inventory as of a given date.
+
+    Args:
+        as_of_date: date to retun the available inventory
+    """
+    try:
+        inventory = get_all_inventory(as_of_date)
+        return {
+            "success": True,
+            "as_of_date": as_of_date,
+            "inventory": inventory
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@tool
 def check_inventory(item_name: str, as_of_date: str) -> dict:
     """
     Check the current stock level for a specific paper item.
@@ -723,7 +744,6 @@ def check_supplier_delivery(input_date_str: str, quantity: int, requested_delive
 """Set up tools for your agents to use, these should be methods that combine the database functions above
  and apply criteria to them to ensure that the flow of the system is correct."""
 
-# Tools for quoting agent
 @tool
 def quote_history_tool(
     search_terms: List[str],
@@ -737,44 +757,59 @@ def quote_history_tool(
         limit: Maximum number of quote-history results to return.
  
     Returns:
-          A dictionary containing the quote-history search results.
- 
-        Each historical quote may contain:
-        - original_request
-        - total_amount
-        - quote_explanation
-        - job_type
-        - order_size
-        - event_type
-        - order_date
-    
-        IMPORTANT:
-        The total_amount field represents the historical total quoted price.
-        Use relevant historical total_amount values to estimate a reasonable
-        price for the current customer request.
-    
-        When recommending fulfillment, the calculated total_price must be
-        greater than 0
+        A dictionary containing historical quote records.
     """
- 
     try:
         quotes = search_quote_history(
             search_terms=search_terms,
             limit=limit
         )
  
+        # Convert DataFrame results into records that the agent
+        # can read reliably.
+        if isinstance(quotes, pd.DataFrame):
+            quote_records = quotes.to_dict(orient="records")
+        elif isinstance(quotes, list):
+            quote_records = quotes
+        else:
+            quote_records = []
+ 
+        # Extract available historical prices explicitly
+        historical_prices = []
+ 
+        for quote in quote_records:
+            if isinstance(quote, dict):
+                amount = quote.get("total_amount")
+ 
+                if amount is not None:
+                    try:
+                        amount = float(amount)
+ 
+                        if amount > 0:
+                            historical_prices.append(amount)
+ 
+                    except (TypeError, ValueError):
+                        pass
+ 
         return {
             "success": True,
             "search_terms": search_terms,
-            "quotes": quotes
+            "quote_count": len(quote_records),
+            "quotes": quote_records,
+            "historical_prices": historical_prices,
+            "has_pricing_data": len(historical_prices) > 0
         }
  
     except Exception as e:
         return {
             "success": False,
-            "error": str(e)
+            "error": str(e),
+            "quote_count": 0,
+            "quotes": [],
+            "historical_prices": [],
+            "has_pricing_data": False
         }
-
+ 
 @tool
 def cash_balance_tool(as_of_date: str) -> dict:
     """
@@ -836,7 +871,7 @@ def fulfill_order_tool(
     sale_date: str
 ) -> dict:
     """
-     Record a completed customer sale.
+    Record a completed customer sale.
  
     Args:
         item_name: Name of the item being sold.
@@ -849,36 +884,67 @@ def fulfill_order_tool(
     """
  
     try:
+        # A fulfilled order must always have a positive quoted price
         if total_price <= 0:
             return {
                 "success": False,
-                "message": "Cannot fulfill order because total_price must be greater than 0."
+                "message": (
+                    "Cannot fulfill order because total_price must "
+                    "be greater than 0."
+                )
             }
+ 
+        # Normalize common customer descriptions to inventory item names
+        item_mapping = {
+            "a4 glossy paper": "Glossy paper",
+            "glossy a4 paper": "Glossy paper",
+            "glossy paper": "Glossy paper",
+ 
+            "colored paper": "Colored paper",
+            "colorful paper": "Colored paper",
+            "coloured paper": "Colored paper",
+ 
+            "heavy cardstock": "Cardstock",
+            "heavy cardstock (white)": "Cardstock",
+            "cardstock": "Cardstock",
+ 
+            "a4 paper": "A4 paper",
+            "white a4 paper": "A4 paper",
+            "matte a4 paper": "A4 paper",
+ 
+            "poster board": "Large poster paper (24x36 inches)",
+            "poster boards": "Large poster paper (24x36 inches)",
+            "poster board paper": "Large poster paper (24x36 inches)"
+        }
+ 
+        normalized_name = item_name.strip().lower()
+ 
+        inventory_item_name = item_mapping.get(
+            normalized_name,
+            item_name.strip()
+        )
+ 
+        # Confirm that the item exists in inventory.
+        #
+        # Do NOT reject here only because current stock is below
+        # the requested quantity. The Inventory Agent has already
+        # determined whether supplier replenishment can arrive
+        # before the requested delivery date.
         stock_df = get_stock_level(
-            item_name,
+            inventory_item_name,
             sale_date
         )
  
         if stock_df.empty:
             return {
                 "success": False,
-                "message": "Item not found."
+                "message": "Item not found.",
+                "item_name": inventory_item_name
             }
  
-        available_stock = int(
-            stock_df.iloc[0]["current_stock"]
-        )
- 
-        if available_stock < quantity:
-            return {
-                "success": False,
-                "message": "Insufficient inventory.",
-                "available_stock": available_stock,
-                "requested_quantity": quantity
-            }
- 
+        # Record the completed sale
         transaction_id = create_transaction(
-            item_name=item_name,
+            item_name=inventory_item_name,
             transaction_type="sales",
             quantity=quantity,
             price=total_price,
@@ -888,7 +954,7 @@ def fulfill_order_tool(
         return {
             "success": True,
             "transaction_id": transaction_id,
-            "item_name": item_name,
+            "item_name": inventory_item_name,
             "quantity": quantity,
             "total_price": total_price
         }
@@ -905,7 +971,8 @@ def fulfill_order_tool(
 inventory_worker = ToolCallingAgent(
     tools=[
         check_inventory,
-        check_supplier_delivery
+        check_supplier_delivery,
+        all_inventory_tool
     ],
     model=agent_model,
     name="inventory_agent",
@@ -1018,30 +1085,84 @@ to determine a reasonable unit price and calculate a positive total price.
 Use the available quoting and financial tools when needed.
 Consider historical quotes and relevant financial information.
 
-When searching historical quote data:
-- Do not search only for the customer's exact item description.
-- Use quote_history_tool with multiple relevant search terms.
-- Include broader product terms and remove size, color, or descriptive words when necessary.
-- For example, for "A4 glossy paper", search using terms such as:
-  ["A4 glossy paper", "glossy paper", "A4 paper", "paper"]
-- Review the returned historical quotes and use the most relevant comparable quote.
-- If an exact match is unavailable, use the closest relevant historical quote to determine a reasonable unit price.
-- Do not report that historical pricing is unavailable until broader relevant searches have also been attempted.
-- Never invent a price that is unsupported by the historical quote results.
+HISTORICAL PRICING RULES:
  
-You MUST return a numeric proposed total price greater than 0
-when recommending that an order can be fulfilled.
+You MUST make multiple pricing attempts before concluding that pricing
+is unavailable.
  
-Clearly state:
-- the proposed unit price when available
-- the requested quantity
-- the calculated total_price
+For each requested paper item:
+ 
+1. First search using the customer's exact item description.
+ 
+2. If no historical pricing is returned, immediately search using a
+   simpler canonical description.
+ 
+Examples:
+- "A4 glossy paper" -> search "glossy paper"
+- "heavy cardstock (white)" -> search "cardstock"
+- "colored paper (assorted colors)" -> search "colored paper"
+- "A4 paper" -> search "A4 paper"
+- "poster board" -> search "poster paper"
+ 
+3. If that search still returns no pricing, broaden the search again
+   using "paper".
+ 
+4. If quote_history_tool returns:
+       has_pricing_data = True
+   you MUST use one of the returned historical_prices to determine
+   a reasonable positive unit_price.
+ 
+5. Do NOT reject pricing merely because:
+   - current_stock is 0,
+   - cash_balance is 0 or low,
+   - supplier replenishment is required.
+ 
+Inventory feasibility is handled by the Inventory Agent.
+Cash balance does not prevent quoting a customer sale.
+ 
+6. Only state that historical pricing is unavailable AFTER all relevant
+   exact and broader searches have been attempted.
+ 
+7. Never return total_price = 0 for an order when usable historical
+   pricing data has been found.
  
 Calculate:
+ 
+    total_price = unit_price * requested_quantity
+ 
+The returned total_price must be greater than 0.
+
+CRITICAL:
+ 
+If the Inventory Agent has already determined that inventory can be
+available by the customer's requested delivery date, DO NOT reconsider
+or reject the order because current_stock is 0.
+ 
+Your responsibility is pricing only.
+ 
+If historical pricing is found, return a positive total_price to the
+Orchestrator so that it can continue to the Sales Agent.
+
+IMPORTANT PRICING RULES:
+ 
+For customer sales, DO NOT reject or refuse to provide a quote
+because the company's cash balance is zero.
+ 
+Cash balance is only relevant when additional inventory must be purchased.
+ 
+You MUST attempt to determine a positive unit price using historical quotes.
+ 
+If an exact historical match is unavailable:
+1. Search using broader item terms.
+2. Use the closest relevant historical quote.
+3. Use its historical price as the pricing reference.
+ 
+Never return a price of 0 for an order that can otherwise be fulfilled.
+ 
+For every order that can be fulfilled:
 total_price = unit_price * quantity
  
-Never return 0.0 as the price of a fulfilled order.
-Return the proposed price and a concise recommendation to the manager agent.
+The returned total_price MUST be greater than 0.
 """
 )
 
@@ -1128,6 +1249,8 @@ Use the Sales Agent for:
  
 IMPORTANT DATE RULE:
  
+IMPORTANT DATE RULE:
+ 
 When inventory requires supplier replenishment, compare the supplier
 delivery date with the customer's requested delivery date.
  
@@ -1145,10 +1268,38 @@ Always compare dates chronologically.
 For example, 2023-10-14 is before 2025-04-15, so inventory arriving
 on 2023-10-14 IS available in time for an order required by 2025-04-15.
  
+CRITICAL FULFILLMENT RULES:
+ 
 Do not reject an order merely because current_stock is insufficient.
-Reject it only when the shortage cannot be replenished by the customer's
-requested delivery date.
-
+ 
+If current_stock is less than the requested quantity:
+- Determine the shortage.
+- Ask the Inventory Agent for the supplier_delivery_date.
+- If supplier_delivery_date <= requested_delivery_date, treat the shortage
+  as available in time and continue to the Quoting Agent.
+- If supplier_delivery_date > requested_delivery_date, the order cannot
+  be fulfilled.
+ 
+IMPORTANT CASH RULE:
+ 
+A cash balance of 0 or a low cash balance does NOT automatically make a
+customer order unfulfillable.
+ 
+Do NOT reject a customer sale merely because cash_balance is 0 or because
+the company currently has insufficient cash.
+ 
+If existing inventory OR supplier replenishment arriving on or before the
+requested delivery date can satisfy the order, continue to the Quoting Agent.
+ 
+The Quoting Agent must attempt to obtain a positive total_price.
+ 
+If a valid total_price > 0 is obtained, continue to the Sales Agent and
+fulfill the order.
+ 
+Only reject the order when:
+- the required inventory cannot be available by the requested delivery date, or
+- no valid positive price can be determined after historical pricing attempts.
+ 
 For a customer order:
 1. Determine the requested paper item, quantity, and request date.
 2. Delegate inventory analysis to the Inventory Agent.
@@ -1165,155 +1316,268 @@ managed agent is available.
 )
  
 # Run your test scenarios by writing them here. Make sure to keep track of them.
-
 def run_test_scenarios():
     """
-    Run end-to-end scenarios through the LLM-powered orchestrator.
+    Run all requests from quote_requests_sample.csv
+    through the orchestrator and validate evaluation requirements.
     """
  
     df = pd.read_csv("quote_requests_sample.csv")
  
-    print(f"Loaded {len(df)} requests from quote_requests_sample.csv")
+    print(f"\nLoaded {len(df)} requests from quote_requests_sample.csv")
  
     results = []
  
-    for index, row in df.iterrows():
+    for index, request_row in df.iterrows():
+ 
         print("\n" + "=" * 60)
         print(f"REQUEST {index + 1}")
         print("=" * 60)
-        print(row["request"])
+        print(request_row["request"])
  
-        # Capture the latest transaction before processing this request
+        # -----------------------------------------------------
+        # Capture number of SALES before this request
+        # -----------------------------------------------------
         with db_engine.connect() as conn:
-            before_transaction_id = conn.execute(
+            sales_before = conn.execute(
                 text("""
-                    SELECT COALESCE(MAX(id), 0)
+                    SELECT COUNT(*)
                     FROM transactions
+                    WHERE transaction_type = 'sales'
                 """)
             ).scalar()
  
-        result = orchestrator_agent.run(
-            f"""
-            Customer request:
-            {str(row["request"])}
-        
-            Request date: {str(row["request_date"])}
-        
-            Process this request through the appropriate agents.
-            Check inventory first.
-            If sufficient inventory is available, obtain a valid quote and fulfill the order.
-            If inventory is insufficient or the request cannot be fulfilled, do not create a sale.
-            """
+        # -----------------------------------------------------
+        # Capture cash before this request
+        # -----------------------------------------------------
+        cash_before = get_cash_balance(datetime.now())
+ 
+        # -----------------------------------------------------
+        # Run request through orchestrator
+        # -----------------------------------------------------
+        try:
+            result = orchestrator_agent.run(
+                f"""
+Customer request:
+ 
+{str(request_row["request"])}
+ 
+Request date: {str(request_row["request_date"])}
+ 
+Process this request through the appropriate agents.
+ 
+Check inventory first.
+ 
+If sufficient inventory is available, obtain a valid positive quote
+and fulfill the order.
+ 
+If inventory is insufficient, determine whether supplier replenishment
+can arrive on or before the requested delivery date.
+ 
+If replenishment can arrive in time, treat the required inventory as
+available and continue to pricing.
+ 
+If a valid positive price is obtained, send the order to the Sales Agent
+and record the completed sale.
+ 
+Do not reject the order merely because current inventory is insufficient
+or because the current cash balance is low or zero.
+ 
+If the request cannot be fulfilled, clearly explain the reason.
+"""
+            )
+ 
+            result_text = str(result)
+ 
+        except Exception as e:
+            # Do not stop processing the remaining requests
+            result_text = f"Request could not be fulfilled because: {str(e)}"
+ 
+            print("\nERROR PROCESSING REQUEST:")
+            print(result_text)
+ 
+        # -----------------------------------------------------
+        # Capture number of SALES after this request
+        # -----------------------------------------------------
+        with db_engine.connect() as conn:
+            sales_after = conn.execute(
+                text("""
+                    SELECT COUNT(*)
+                    FROM transactions
+                    WHERE transaction_type = 'sales'
+                """)
+            ).scalar()
+ 
+        # -----------------------------------------------------
+        # Capture cash after this request
+        # -----------------------------------------------------
+        cash_after = get_cash_balance(datetime.now())
+ 
+        # -----------------------------------------------------
+        # Determine fulfillment
+        # -----------------------------------------------------
+        sales_created = int(sales_after) - int(sales_before)
+ 
+        fulfilled = sales_created > 0
+ 
+        cash_changed = cash_before != cash_after
+ 
+        # Since a completed customer sale changes cash,
+        # use the verified cash difference for this evaluation.
+        total_price = (
+            abs(float(cash_after) - float(cash_before))
+            if fulfilled
+            else 0.0
         )
  
-        # Check whether this request created a sale
-        # Find a sale created specifically while processing this request
-        with db_engine.connect() as conn:
-            latest_sale = conn.execute(
-                text("""
-                    SELECT price
-                    FROM transactions
-                    WHERE transaction_type = 'sale'
-                    AND id > :before_transaction_id
-                    ORDER BY id DESC
-                    LIMIT 1
-                """),
-                {"before_transaction_id": before_transaction_id}
-            ).fetchone()
-        
-        fulfilled = latest_sale is not None
-        total_price = float(latest_sale[0]) if latest_sale else 0.0
-
-        # Get the cash balance after processing this request
-        cash_balance = get_cash_balance(datetime.now())
-
+        # Clear reason for rejected/unfulfilled request
+        if fulfilled:
+            unfulfilled_reason = ""
+        else:
+            unfulfilled_reason = result_text.strip()
+ 
+        # -----------------------------------------------------
+        # Store result
+        # -----------------------------------------------------
         results.append({
             "request_id": index + 1,
-            "job": row["job"],
-            "need_size": row["need_size"],
-            "event": row["event"],
-            "request": row["request"],
-            "request_date": row["request_date"],
-            "cash_balance": cash_balance,
+            "job": request_row["job"],
+            "need_size": request_row["need_size"],
+            "event": request_row["event"],
+            "request": request_row["request"],
+            "request_date": request_row["request_date"],
+ 
+            "cash_before": cash_before,
+            "cash_balance": cash_after,
+            "cash_changed": cash_changed,
+ 
+            "sales_created": sales_created,
+ 
             "fulfilled": fulfilled,
             "total_price": total_price,
-            "result": str(result)
-        })
-    results_df = pd.DataFrame(results)
-
-    print("\n--- FULFILLMENT SUMMARY ---")
-    print(results_df[["request_id", "fulfilled", "total_price"]].to_string(index=False))
-
-    results_df.to_csv("test_results.csv", index=False)
-    
-    print("\nEvaluation completed.")
-    print(f"Total requests processed: {len(results_df)}")
-    print("Results saved to test_results.csv")
-    print("\n--- FINAL ORCHESTRATOR RESULT ---")
-    print(json.dumps(result, indent=2, default=str))
  
-    return results
-    
+            "result": result_text,
+            "unfulfilled_reason": unfulfilled_reason
+        })
+ 
+        print("\n--- REQUEST RESULT ---")
+        print(f"Sales before: {sales_before}")
+        print(f"Sales after: {sales_after}")
+        print(f"Sales created: {sales_created}")
+        print(f"Fulfilled: {fulfilled}")
+        print(f"Cash before: {cash_before}")
+        print(f"Cash after: {cash_after}")
+        print(f"Cash changed: {cash_changed}")
+        print(f"Total price: {total_price}")
+ 
+    # =========================================================
+    # Create final dataframe
+    # =========================================================
+    results_df = pd.DataFrame(results)
+ 
+    # Save BEFORE assertions so results are available
+    # even if one validation requirement fails.
+    results_df.to_csv(
+        "test_results.csv",
+        index=False
+    )
+ 
+    print("\n" + "=" * 60)
+    print("FULFILLMENT SUMMARY")
+    print("=" * 60)
+ 
+    print(
+        results_df[
+            [
+                "request_id",
+                "fulfilled",
+                "sales_created",
+                "total_price",
+                "cash_before",
+                "cash_balance",
+                "cash_changed"
+            ]
+        ].to_string(index=False)
+    )
+ 
+    # =========================================================
+    # Reviewer validation
+    # =========================================================
+ 
+    total_requests = len(results_df)
+ 
+    fulfilled_count = int(
+        results_df["fulfilled"].sum()
+    )
+ 
+    cash_change_count = int(
+        results_df["cash_changed"].sum()
+    )
+ 
+    unfulfilled_with_reason = results_df[
+        (results_df["fulfilled"] == False)
+        &
+        (
+            results_df["unfulfilled_reason"]
+            .fillna("")
+            .str.strip()
+            .ne("")
+        )
+    ]
+ 
+    print("\n" + "=" * 60)
+    print("REVIEWER VALIDATION SUMMARY")
+    print("=" * 60)
+ 
+    print(f"Total requests processed: {total_requests}")
+    print(f"Fulfilled requests: {fulfilled_count}")
+    print(f"Rows where cash balance changed: {cash_change_count}")
+    print(
+        "Unfulfilled requests with reason: "
+        f"{len(unfulfilled_with_reason)}"
+    )
+ 
+    # =========================================================
+    # Required reviewer conditions
+    # =========================================================
+ 
+    assert total_requests == 20, (
+        f"Expected 20 processed requests, "
+        f"but got {total_requests}"
+    )
+ 
+    assert fulfilled_count >= 3, (
+        f"Expected at least 3 fulfilled requests, "
+        f"but got {fulfilled_count}"
+    )
+ 
+    assert cash_change_count >= 3, (
+        f"Expected at least 3 rows where cash balance changes, "
+        f"but got {cash_change_count}"
+    )
+ 
+    assert len(unfulfilled_with_reason) >= 1, (
+        "Expected at least one unfulfilled request "
+        "with a clear reason."
+    )
+ 
+    print("\nALL REVIEWER VALIDATION CHECKS PASSED")
+ 
+    print("\nUnfulfilled requests:")
+    print(
+        unfulfilled_with_reason[
+            [
+                "request_id",
+                "request",
+                "unfulfilled_reason"
+            ]
+        ].to_string(index=False)
+    )
+ 
+    print("\nEvaluation completed.")
+    print("Results saved to test_results.csv")
+
 if __name__ == "__main__":
     init_database(db_engine)
-
-    print("\n--- SINGLE ORCHESTRATOR TEST ---")
  
-    test_result = orchestrator_agent.run(
-        """
-        I need 200 sheets of A4 glossy paper.
-        I need these supplies delivered by April 15, 2025.
-    
-        Check inventory, check supplier delivery if stock is insufficient,
-        obtain pricing, and fulfill the order only if it can be delivered
-        by the requested date.
-        """
-    )
- 
-    print("\n--- SINGLE TEST RESULT ---")
-    print(test_result)
-
-    print("\n--- CHECK INVENTORY WRAPPER TEST ---")
- 
-    test_inventory = check_inventory(
-        item_name="colored paper",
-        as_of_date="2025-04-01"
-    )
-
-    print(test_inventory)
-
-
     run_test_scenarios()
-    # # INSUFFICIENT INVENTORY TEST
-    # test_result = orchestrator_agent.run(
-    #         "I need 10000 units of A4 paper. "
-    #         "Check availability and provide a quote. "
-    #         "Process the order only if enough inventory is currently available."
-    #     )
- 
-    # print("\n--- ORCHESTRATOR INSUFFICIENT INVENTORY TEST ---")
-    # print(json.dumps(test_result, indent=2, default=str))
-
-    # # print("\n=== AVAILABLE INVENTORY ===")
-    # # print(get_all_inventory("2025-01-10"))
-
-
-    # # print("\n=== QUOTE HISTORY TEST ===")
- 
-    # # quote_test = quote_history_tool(
-    # #     search_terms=["Glossy paper"],
-    # #     limit=5
-    # # )
- 
-    # # print(json.dumps(quote_test, indent=2, default=str))
-
-    # # SUFFICIENT INVENTORY TEST (check_inventory -> quoting agent -> sales agent -> fulfill_order_tool)
-    # test_result = orchestrator_agent.run(
-    #         "I need 10 units of Glossy paper. "
-    #         "The request date is 2025-01-10"
-    #         "Check availability as of 2025-01-10, provide a quote, and process the order "
-    #         "if enough inventory is currently available."
-    #     )
- 
-    # print("\n=== ORCHESTRATOR SUFFICIENT INVENTORY TEST ===")
-    # print(json.dumps(test_result, indent=2, default=str))
